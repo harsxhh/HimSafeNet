@@ -28,6 +28,10 @@ class MeshService : Service() {
   private val seenAlertIds = ConcurrentHashMap.newKeySet<String>()
   private val serviceId = "com.himsafenetmesh.mesh"
   private val endpointName = Build.MODEL ?: "Android"
+  private var isAdvertising = false
+  private var isDiscovering = false
+  private val discoveryHandler = android.os.Handler(android.os.Looper.getMainLooper())
+  private val connectionHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
   override fun onCreate() {
     super.onCreate()
@@ -35,18 +39,13 @@ class MeshService : Service() {
     MeshModule.emitStatus("🔧 Starting mesh service...")
     startForegroundNotification()
     
-    // Start advertising first, then discovery with a small delay
+    // Start advertising and discovery
     startAdvertising()
+    startDiscovery()
     
-    // Start discovery after a short delay to ensure advertising is ready
-    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-      startDiscovery()
-    }, 1000)
-    
-    // Add periodic status logging
-    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-      logDetailedStatus()
-    }, 5000)
+    // Start periodic tasks
+    startPeriodicDiscovery()
+    startPeriodicStatusCheck()
     
     logStatus()
   }
@@ -162,11 +161,13 @@ class MeshService : Service() {
           android.util.Log.e("MeshService", "❌ Failed to request connection to: $endpointId", e)
           MeshModule.emitStatus("❌ Failed to request connection: ${e.message}")
           
-          // Retry connection after 2 seconds
-          android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            android.util.Log.d("MeshService", "🔄 Retrying connection to: $endpointId")
-            connections.requestConnection(endpointName, endpointId, connectionLifecycleCallback)
-          }, 2000)
+          // Retry connection after 3 seconds, but only if not already connected
+          if (!connectedEndpoints.contains(endpointId)) {
+            connectionHandler.postDelayed({
+              android.util.Log.d("MeshService", "🔄 Retrying connection to: $endpointId")
+              connections.requestConnection(endpointName, endpointId, connectionLifecycleCallback)
+            }, 3000)
+          }
         }
     }
     override fun onEndpointLost(endpointId: String) {
@@ -176,34 +177,60 @@ class MeshService : Service() {
   }
 
   private fun startAdvertising() {
+    if (isAdvertising) {
+      android.util.Log.d("MeshService", "Already advertising, skipping")
+      return
+    }
+    
     android.util.Log.d("MeshService", "Starting advertising with strategy: $strategy")
     android.util.Log.d("MeshService", "Service ID: $serviceId, Endpoint: $endpointName")
     
     val options = AdvertisingOptions.Builder().setStrategy(strategy).build()
     connections.startAdvertising(endpointName, serviceId, connectionLifecycleCallback, options)
       .addOnSuccessListener { 
+        isAdvertising = true
         android.util.Log.d("MeshService", "✅ Started advertising successfully")
         MeshModule.emitStatus("📡 Started advertising - waiting for peers...")
       }
       .addOnFailureListener { 
+        isAdvertising = false
         android.util.Log.e("MeshService", "❌ Failed to start advertising", it)
         MeshModule.emitStatus("❌ Failed to start advertising: ${it.message}")
+        
+        // Retry advertising after 5 seconds
+        connectionHandler.postDelayed({
+          android.util.Log.d("MeshService", "🔄 Retrying advertising...")
+          startAdvertising()
+        }, 5000)
       }
   }
 
   private fun startDiscovery() {
+    if (isDiscovering) {
+      android.util.Log.d("MeshService", "Already discovering, skipping")
+      return
+    }
+    
     android.util.Log.d("MeshService", "Starting discovery with strategy: $strategy")
     android.util.Log.d("MeshService", "Looking for service ID: $serviceId")
     
     val options = DiscoveryOptions.Builder().setStrategy(strategy).build()
     connections.startDiscovery(serviceId, endpointDiscoveryCallback, options)
       .addOnSuccessListener { 
+        isDiscovering = true
         android.util.Log.d("MeshService", "✅ Started discovery successfully")
         MeshModule.emitStatus("🔍 Started discovery - looking for peers...")
       }
       .addOnFailureListener { 
+        isDiscovering = false
         android.util.Log.e("MeshService", "❌ Failed to start discovery", it)
         MeshModule.emitStatus("❌ Failed to start discovery: ${it.message}")
+        
+        // Retry discovery after 5 seconds
+        discoveryHandler.postDelayed({
+          android.util.Log.d("MeshService", "🔄 Retrying discovery...")
+          startDiscovery()
+        }, 5000)
       }
   }
 
@@ -300,14 +327,59 @@ class MeshService : Service() {
     android.util.Log.d("MeshService", "📊 Endpoint name: $endpointName")
     android.util.Log.d("MeshService", "📊 Service ID: $serviceId")
     android.util.Log.d("MeshService", "📊 Strategy: $strategy")
+    android.util.Log.d("MeshService", "📊 Advertising: $isAdvertising")
+    android.util.Log.d("MeshService", "📊 Discovering: $isDiscovering")
     MeshModule.emitStatus("📊 Status: ${connectedEndpoints.size} peers connected")
+  }
+  
+  private fun startPeriodicDiscovery() {
+    // Restart discovery every 30 seconds to find new peers
+    discoveryHandler.postDelayed(object : Runnable {
+      override fun run() {
+        android.util.Log.d("MeshService", "🔄 Periodic discovery restart")
+        if (isDiscovering) {
+          connections.stopDiscovery()
+          isDiscovering = false
+        }
+        startDiscovery()
+        discoveryHandler.postDelayed(this, 30000) // 30 seconds
+      }
+    }, 30000)
+  }
+  
+  private fun startPeriodicStatusCheck() {
+    // Check status every 10 seconds
+    connectionHandler.postDelayed(object : Runnable {
+      override fun run() {
+        logDetailedStatus()
+        
+        // Restart advertising if it stopped
+        if (!isAdvertising) {
+          android.util.Log.d("MeshService", "🔄 Restarting advertising...")
+          startAdvertising()
+        }
+        
+        // Restart discovery if it stopped
+        if (!isDiscovering) {
+          android.util.Log.d("MeshService", "🔄 Restarting discovery...")
+          startDiscovery()
+        }
+        
+        connectionHandler.postDelayed(this, 10000) // 10 seconds
+      }
+    }, 10000)
   }
 
   override fun onDestroy() {
     super.onDestroy()
+    isAdvertising = false
+    isDiscovering = false
+    discoveryHandler.removeCallbacksAndMessages(null)
+    connectionHandler.removeCallbacksAndMessages(null)
     connections.stopAdvertising()
     connections.stopDiscovery()
     connections.stopAllEndpoints()
+    android.util.Log.d("MeshService", "MeshService destroyed")
   }
 }
 
