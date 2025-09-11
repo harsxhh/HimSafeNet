@@ -63,7 +63,10 @@ class MeshModule(private val ctx: ReactApplicationContext) : ReactContextBaseJav
       Manifest.permission.ACCESS_FINE_LOCATION,
       Manifest.permission.ACCESS_COARSE_LOCATION,
       Manifest.permission.BLUETOOTH_CONNECT,
-      Manifest.permission.BLUETOOTH_SCAN
+      Manifest.permission.BLUETOOTH_SCAN,
+      Manifest.permission.POST_NOTIFICATIONS,
+      Manifest.permission.WAKE_LOCK,
+      Manifest.permission.USE_FULL_SCREEN_INTENT
     )
 
     // Check which permissions are already granted

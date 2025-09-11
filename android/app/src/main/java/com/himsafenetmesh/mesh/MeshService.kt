@@ -39,9 +39,13 @@ class MeshService : Service() {
     MeshModule.emitStatus("🔧 Starting mesh service...")
     startForegroundNotification()
     
-    // Start advertising and discovery
+    // Start advertising first
     startAdvertising()
-    startDiscovery()
+    
+    // Start discovery after a delay to avoid "out of order" errors
+    discoveryHandler.postDelayed({
+      startDiscovery()
+    }, 2000)
     
     // Start periodic tasks
     startPeriodicDiscovery()
@@ -62,15 +66,43 @@ class MeshService : Service() {
 
   private fun startForegroundNotification() {
     try {
-      val channelId = "mesh"
+      val channelId = "mesh_service"
+      val alertChannelId = "mesh_alerts"
       val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+      
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        nm.createNotificationChannel(NotificationChannel(channelId, "Mesh", NotificationManager.IMPORTANCE_LOW))
+        // Service notification channel (low priority)
+        val serviceChannel = NotificationChannel(
+          channelId, 
+          "Mesh Service", 
+          NotificationManager.IMPORTANCE_LOW
+        ).apply {
+          description = "Background mesh networking service"
+          setShowBadge(false)
+        }
+        
+        // Alert notification channel (high priority)
+        val alertChannel = NotificationChannel(
+          alertChannelId, 
+          "Emergency Alerts", 
+          NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+          description = "Emergency alerts from nearby devices"
+          enableLights(true)
+          enableVibration(true)
+          setShowBadge(true)
+        }
+        
+        nm.createNotificationChannel(serviceChannel)
+        nm.createNotificationChannel(alertChannel)
       }
+      
       val notif: Notification = NotificationCompat.Builder(this, channelId)
         .setContentTitle("HimSafeNet Mesh")
-        .setContentText("Relaying alerts offline")
+        .setContentText("Relaying alerts offline - ${connectedEndpoints.size} peers")
         .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+        .setOngoing(true)
+        .setPriority(NotificationCompat.PRIORITY_LOW)
         .build()
       startForeground(1, notif)
       android.util.Log.d("MeshService", "Foreground notification started")
@@ -125,6 +157,7 @@ class MeshService : Service() {
         connectedEndpoints.add(endpointId)
         android.util.Log.d("MeshService", "✅ CONNECTED to peer: $endpointId")
         MeshModule.emitStatus("✅ Connected to peer: $endpointId")
+        updateForegroundNotification()
         logStatus()
       } else {
         android.util.Log.w("MeshService", "❌ FAILED to connect to peer: $endpointId, status: ${result.status}")
@@ -136,6 +169,7 @@ class MeshService : Service() {
       connectedEndpoints.remove(endpointId)
       android.util.Log.d("MeshService", "❌ DISCONNECTED from peer: $endpointId")
       MeshModule.emitStatus("❌ Disconnected from peer: $endpointId")
+      updateForegroundNotification()
       logStatus()
     }
   }
@@ -224,13 +258,17 @@ class MeshService : Service() {
       .addOnFailureListener { 
         isDiscovering = false
         android.util.Log.e("MeshService", "❌ Failed to start discovery", it)
+        android.util.Log.e("MeshService", "❌ Error details: ${it.message}")
         MeshModule.emitStatus("❌ Failed to start discovery: ${it.message}")
         
-        // Retry discovery after 5 seconds
-        discoveryHandler.postDelayed({
-          android.util.Log.d("MeshService", "🔄 Retrying discovery...")
-          startDiscovery()
-        }, 5000)
+        // Only retry if it's not an "already discovering" error
+        val isAlreadyDiscovering = it.message?.contains("already discovering", ignoreCase = true) ?: false
+        if (!isAlreadyDiscovering) {
+          discoveryHandler.postDelayed({
+            android.util.Log.d("MeshService", "🔄 Retrying discovery...")
+            startDiscovery()
+          }, 5000)
+        }
       }
   }
 
@@ -315,6 +353,55 @@ class MeshService : Service() {
   private fun onAlertReceived(msg: AlertMessage) {
     // Emit to JS UI via NativeModule event
     MeshModule.emitAlert(msg.id, msg.text, msg.timestamp, msg.ttl)
+    
+    // Show push notification
+    showAlertNotification(msg)
+  }
+  
+  private fun showAlertNotification(msg: AlertMessage) {
+    try {
+      val channelId = "mesh_alerts"
+      val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+      
+      // Create a unique notification ID based on alert ID
+      val notificationId = msg.id.hashCode()
+      
+      val notification = NotificationCompat.Builder(this, channelId)
+        .setContentTitle("🚨 Emergency Alert")
+        .setContentText(msg.text)
+        .setStyle(NotificationCompat.BigTextStyle()
+          .bigText("Emergency Alert: ${msg.text}\n\nReceived from nearby device via mesh network"))
+        .setSmallIcon(android.R.drawable.ic_dialog_alert)
+        .setLargeIcon(android.graphics.BitmapFactory.decodeResource(resources, android.R.drawable.ic_dialog_alert))
+        .setPriority(NotificationCompat.PRIORITY_HIGH)
+        .setDefaults(NotificationCompat.DEFAULT_ALL)
+        .setAutoCancel(true)
+        .setCategory(NotificationCompat.CATEGORY_ALARM)
+        .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+        .setFullScreenIntent(createFullScreenIntent(msg), true)
+        .build()
+      
+      nm.notify(notificationId, notification)
+      android.util.Log.d("MeshService", "📱 Push notification shown for alert: ${msg.text}")
+      
+    } catch (e: Exception) {
+      android.util.Log.e("MeshService", "Failed to show alert notification", e)
+    }
+  }
+  
+  private fun createFullScreenIntent(msg: AlertMessage): android.app.PendingIntent {
+    val intent = Intent(this, com.himsafenetmesh.MainActivity::class.java).apply {
+      flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+      putExtra("alert_text", msg.text)
+      putExtra("alert_id", msg.id)
+    }
+    
+    return android.app.PendingIntent.getActivity(
+      this, 
+      msg.id.hashCode(), 
+      intent, 
+      android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+    )
   }
 
   private fun logStatus() {
@@ -330,6 +417,34 @@ class MeshService : Service() {
     android.util.Log.d("MeshService", "📊 Advertising: $isAdvertising")
     android.util.Log.d("MeshService", "📊 Discovering: $isDiscovering")
     MeshModule.emitStatus("📊 Status: ${connectedEndpoints.size} peers connected")
+    
+    // Update foreground notification with current status
+    updateForegroundNotification()
+  }
+  
+  private fun updateForegroundNotification() {
+    try {
+      val channelId = "mesh_service"
+      val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+      
+      val statusText = when {
+        connectedEndpoints.isEmpty() -> "Searching for nearby devices..."
+        connectedEndpoints.size == 1 -> "Connected to 1 device"
+        else -> "Connected to ${connectedEndpoints.size} devices"
+      }
+      
+      val notif: Notification = NotificationCompat.Builder(this, channelId)
+        .setContentTitle("HimSafeNet Mesh")
+        .setContentText(statusText)
+        .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+        .setOngoing(true)
+        .setPriority(NotificationCompat.PRIORITY_LOW)
+        .build()
+      
+      nm.notify(1, notif)
+    } catch (e: Exception) {
+      android.util.Log.e("MeshService", "Failed to update foreground notification", e)
+    }
   }
   
   private fun startPeriodicDiscovery() {
@@ -337,14 +452,30 @@ class MeshService : Service() {
     discoveryHandler.postDelayed(object : Runnable {
       override fun run() {
         android.util.Log.d("MeshService", "🔄 Periodic discovery restart")
-        if (isDiscovering) {
-          connections.stopDiscovery()
-          isDiscovering = false
-        }
-        startDiscovery()
+        stopDiscovery()
+        // Wait a bit before restarting to avoid "out of order" errors
+        discoveryHandler.postDelayed({
+          startDiscovery()
+        }, 2000)
         discoveryHandler.postDelayed(this, 30000) // 30 seconds
       }
     }, 30000)
+  }
+  
+  private fun stopDiscovery() {
+    if (isDiscovering) {
+      android.util.Log.d("MeshService", "Stopping discovery...")
+      connections.stopDiscovery()
+      isDiscovering = false
+    }
+  }
+  
+  private fun stopAdvertising() {
+    if (isAdvertising) {
+      android.util.Log.d("MeshService", "Stopping advertising...")
+      connections.stopAdvertising()
+      isAdvertising = false
+    }
   }
   
   private fun startPeriodicStatusCheck() {
@@ -372,12 +503,10 @@ class MeshService : Service() {
 
   override fun onDestroy() {
     super.onDestroy()
-    isAdvertising = false
-    isDiscovering = false
     discoveryHandler.removeCallbacksAndMessages(null)
     connectionHandler.removeCallbacksAndMessages(null)
-    connections.stopAdvertising()
-    connections.stopDiscovery()
+    stopAdvertising()
+    stopDiscovery()
     connections.stopAllEndpoints()
     android.util.Log.d("MeshService", "MeshService destroyed")
   }
