@@ -22,7 +22,7 @@ data class AlertMessage(
 )
 
 class MeshService : Service() {
-  private val strategy = Strategy.P2P_CLUSTER
+  private val strategy = Strategy.P2P_STAR
   private val connections by lazy { Nearby.getConnectionsClient(this) }
   private val connectedEndpoints = ConcurrentHashMap.newKeySet<String>()
   private val seenAlertIds = ConcurrentHashMap.newKeySet<String>()
@@ -42,6 +42,11 @@ class MeshService : Service() {
     android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
       startDiscovery()
     }, 1000)
+    
+    // Add periodic status logging
+    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+      logDetailedStatus()
+    }, 5000)
     
     logStatus()
   }
@@ -79,13 +84,17 @@ class MeshService : Service() {
 
   private val payloadCallback = object : PayloadCallback() {
     override fun onPayloadReceived(endpointId: String, payload: Payload) {
-      android.util.Log.d("MeshService", "Payload received from: $endpointId")
+      android.util.Log.d("MeshService", "🎯 PAYLOAD RECEIVED from: $endpointId")
+      android.util.Log.d("MeshService", "🎯 Payload type: ${payload.type}")
+      android.util.Log.d("MeshService", "🎯 Payload ID: ${payload.id}")
+      
       payload.asBytes()?.let { bytes ->
         val json = String(bytes, StandardCharsets.UTF_8)
-        android.util.Log.d("MeshService", "Received JSON: $json")
+        android.util.Log.d("MeshService", "📨 Received JSON: $json")
+        android.util.Log.d("MeshService", "📨 JSON length: ${json.length}")
         handleIncoming(json)
       } ?: run {
-        android.util.Log.w("MeshService", "Received payload with no bytes from: $endpointId")
+        android.util.Log.w("MeshService", "⚠️ Received payload with no bytes from: $endpointId")
       }
     }
     override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
@@ -95,32 +104,38 @@ class MeshService : Service() {
 
   private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
     override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
-      android.util.Log.d("MeshService", "Connection initiated with: $endpointId")
+      android.util.Log.d("MeshService", "🤝 CONNECTION INITIATED with: $endpointId")
+      android.util.Log.d("MeshService", "🤝 Endpoint name: ${info.endpointName}")
+      android.util.Log.d("MeshService", "🤝 Authentication token: ${info.authenticationToken}")
       MeshModule.emitStatus("🤝 Connection initiated with: $endpointId")
+      
+      android.util.Log.d("MeshService", "✅ Accepting connection from: $endpointId")
       connections.acceptConnection(endpointId, payloadCallback)
         .addOnSuccessListener {
-          android.util.Log.d("MeshService", "Connection accepted: $endpointId")
+          android.util.Log.d("MeshService", "✅ Connection accepted: $endpointId")
           MeshModule.emitStatus("✅ Connection accepted: $endpointId")
         }
         .addOnFailureListener { e ->
-          android.util.Log.e("MeshService", "Failed to accept connection: $endpointId", e)
+          android.util.Log.e("MeshService", "❌ Failed to accept connection: $endpointId", e)
           MeshModule.emitStatus("❌ Failed to accept connection: ${e.message}")
         }
     }
     override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
+      android.util.Log.d("MeshService", "📊 CONNECTION RESULT for $endpointId: ${result.status}")
       if (result.status.isSuccess) {
         connectedEndpoints.add(endpointId)
-        android.util.Log.d("MeshService", "Connected to peer: $endpointId")
+        android.util.Log.d("MeshService", "✅ CONNECTED to peer: $endpointId")
         MeshModule.emitStatus("✅ Connected to peer: $endpointId")
         logStatus()
       } else {
-        android.util.Log.w("MeshService", "Failed to connect to peer: $endpointId, status: ${result.status}")
+        android.util.Log.w("MeshService", "❌ FAILED to connect to peer: $endpointId, status: ${result.status}")
+        android.util.Log.w("MeshService", "❌ Status code: ${result.status.statusCode}")
         MeshModule.emitStatus("❌ Failed to connect to peer: ${result.status}")
       }
     }
     override fun onDisconnected(endpointId: String) {
       connectedEndpoints.remove(endpointId)
-      android.util.Log.d("MeshService", "Disconnected from peer: $endpointId")
+      android.util.Log.d("MeshService", "❌ DISCONNECTED from peer: $endpointId")
       MeshModule.emitStatus("❌ Disconnected from peer: $endpointId")
       logStatus()
     }
@@ -128,12 +143,34 @@ class MeshService : Service() {
 
   private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
     override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
-      android.util.Log.d("MeshService", "Found peer: $endpointId, name: ${info.endpointName}")
+      android.util.Log.d("MeshService", "🔍 FOUND PEER: $endpointId, name: ${info.endpointName}")
+      android.util.Log.d("MeshService", "🔍 Service ID: ${info.serviceId}")
       MeshModule.emitStatus("🔍 Found peer: ${info.endpointName}")
+      
+      // Skip if already connected
+      if (connectedEndpoints.contains(endpointId)) {
+        android.util.Log.d("MeshService", "🔄 Already connected to: $endpointId")
+        return
+      }
+      
+      android.util.Log.d("MeshService", "🤝 Requesting connection to: $endpointId")
       connections.requestConnection(endpointName, endpointId, connectionLifecycleCallback)
+        .addOnSuccessListener {
+          android.util.Log.d("MeshService", "✅ Connection request sent to: $endpointId")
+        }
+        .addOnFailureListener { e ->
+          android.util.Log.e("MeshService", "❌ Failed to request connection to: $endpointId", e)
+          MeshModule.emitStatus("❌ Failed to request connection: ${e.message}")
+          
+          // Retry connection after 2 seconds
+          android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            android.util.Log.d("MeshService", "🔄 Retrying connection to: $endpointId")
+            connections.requestConnection(endpointName, endpointId, connectionLifecycleCallback)
+          }, 2000)
+        }
     }
     override fun onEndpointLost(endpointId: String) {
-      android.util.Log.d("MeshService", "Lost peer: $endpointId")
+      android.util.Log.d("MeshService", "❌ Lost peer: $endpointId")
       MeshModule.emitStatus("❌ Lost peer: $endpointId")
     }
   }
@@ -183,38 +220,55 @@ class MeshService : Service() {
   }
 
   private fun handleIncoming(json: String) {
-    val msg = deserialize(json) ?: return
-    android.util.Log.d("MeshService", "Received alert: ${msg.text}")
-    if (!seenAlertIds.add(msg.id)) {
-      android.util.Log.d("MeshService", "Duplicate alert ignored: ${msg.id}")
+    android.util.Log.d("MeshService", "🔍 Processing incoming JSON: $json")
+    val msg = deserialize(json)
+    if (msg == null) {
+      android.util.Log.e("MeshService", "❌ Failed to deserialize JSON: $json")
       return
     }
+    android.util.Log.d("MeshService", "✅ Deserialized alert: ${msg.text} (ID: ${msg.id})")
+    
+    if (!seenAlertIds.add(msg.id)) {
+      android.util.Log.d("MeshService", "🔄 Duplicate alert ignored: ${msg.id}")
+      return
+    }
+    
+    android.util.Log.d("MeshService", "🚨 EMITTING ALERT TO UI: ${msg.text}")
     onAlertReceived(msg)
+    
     if (msg.ttl > 1) {
       val next = msg.copy(ttl = msg.ttl - 1)
+      android.util.Log.d("MeshService", "📡 Relaying alert (TTL: ${next.ttl})")
       broadcast(serialize(next))
+    } else {
+      android.util.Log.d("MeshService", "⏹️ Alert TTL expired, not relaying")
     }
   }
 
   private fun broadcast(json: String) {
     val payload = Payload.fromBytes(json.toByteArray(StandardCharsets.UTF_8))
-    android.util.Log.d("MeshService", "Broadcasting to ${connectedEndpoints.size} peers")
-    android.util.Log.d("MeshService", "Broadcasting JSON: $json")
+    android.util.Log.d("MeshService", "📡 Broadcasting to ${connectedEndpoints.size} peers")
+    android.util.Log.d("MeshService", "📡 Broadcasting JSON: $json")
+    android.util.Log.d("MeshService", "📡 Payload size: ${json.toByteArray(StandardCharsets.UTF_8).size} bytes")
     MeshModule.emitStatus("📡 Broadcasting to ${connectedEndpoints.size} peers")
+    
     connectedEndpoints.forEach { eid -> 
+      android.util.Log.d("MeshService", "📤 Sending payload to peer: $eid")
       connections.sendPayload(eid, payload)
         .addOnSuccessListener {
-          android.util.Log.d("MeshService", "Successfully sent to peer: $eid")
+          android.util.Log.d("MeshService", "✅ Successfully sent to peer: $eid")
         }
         .addOnFailureListener { e ->
-          android.util.Log.e("MeshService", "Failed to send to peer: $eid", e)
+          android.util.Log.e("MeshService", "❌ Failed to send to peer: $eid", e)
           MeshModule.emitStatus("❌ Failed to send to peer: $eid")
         }
     }
   }
 
-  private fun serialize(msg: AlertMessage): String =
-    """{"id":"${'$'}{msg.id}","text":"${'$'}{msg.text.replace("\"", "\\\"")}","timestamp":${'$'}{msg.timestamp},"ttl":${'$'}{msg.ttl}}"""
+  private fun serialize(msg: AlertMessage): String {
+    val escapedText = msg.text.replace("\"", "\\\"")
+    return """{"id":"${msg.id}","text":"$escapedText","timestamp":${msg.timestamp},"ttl":${msg.ttl}}"""
+  }
 
   private fun deserialize(json: String): AlertMessage? = try {
     val pairs = json.trim('{', '}').split(",")
@@ -238,6 +292,15 @@ class MeshService : Service() {
 
   private fun logStatus() {
     android.util.Log.d("MeshService", "Connected peers: ${connectedEndpoints.size}")
+  }
+  
+  private fun logDetailedStatus() {
+    android.util.Log.d("MeshService", "📊 DETAILED STATUS:")
+    android.util.Log.d("MeshService", "📊 Connected peers: ${connectedEndpoints.size}")
+    android.util.Log.d("MeshService", "📊 Endpoint name: $endpointName")
+    android.util.Log.d("MeshService", "📊 Service ID: $serviceId")
+    android.util.Log.d("MeshService", "📊 Strategy: $strategy")
+    MeshModule.emitStatus("📊 Status: ${connectedEndpoints.size} peers connected")
   }
 
   override fun onDestroy() {
