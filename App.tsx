@@ -5,7 +5,7 @@
  * @format
  */
 
-import { StatusBar, StyleSheet, useColorScheme, View, TextInput, TouchableOpacity, FlatList, Text, Vibration, NativeEventEmitter, NativeModules, ScrollView, Alert } from 'react-native';
+import { StatusBar, StyleSheet, useColorScheme, View, TextInput, TouchableOpacity, Text, Vibration, NativeEventEmitter, NativeModules, ScrollView, Alert, Animated, ActivityIndicator } from 'react-native';
 import {
   SafeAreaProvider,
   useSafeAreaInsets,
@@ -31,6 +31,42 @@ function AppContent() {
   const [log, setLog] = useState<string[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const [peerCount, setPeerCount] = useState(0);
+  const [isLoading, setIsLoading] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected');
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+  const statusColorAnim = useRef(new Animated.Value(0)).current;
+  const scrollViewRef = useRef<ScrollView>(null);
+
+  // Pulse animation for connection status
+  useEffect(() => {
+    if (isConnected) {
+      const pulse = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnim, {
+            toValue: 1.1,
+            duration: 1000,
+            useNativeDriver: true,
+          }),
+          Animated.timing(pulseAnim, {
+            toValue: 1,
+            duration: 1000,
+            useNativeDriver: true,
+          }),
+        ])
+      );
+      pulse.start();
+      return () => pulse.stop();
+    }
+  }, [isConnected]);
+
+  // Status color animation
+  useEffect(() => {
+    Animated.timing(statusColorAnim, {
+      toValue: isConnected ? 1 : 0,
+      duration: 500,
+      useNativeDriver: false,
+    }).start();
+  }, [isConnected]);
 
   useEffect(() => {
     // Start with permissions and service
@@ -38,38 +74,68 @@ function AppContent() {
       
     const emitter = new NativeEventEmitter(NativeModules.Mesh);
     const sub1 = emitter.addListener('AlertReceived', (e: { id: string; text: string; timestamp: number; ttl: number }) => {
-      setLog((l) => [`📨 Received: ${e.text}`, ...l]);
+      const timestamp = new Date().toLocaleTimeString();
+      setLog((l) => [`[${timestamp}] 📨 Received: ${e.text}`, ...l]);
       Vibration.vibrate([200, 100, 200, 100, 200]);
       Alert.alert('🚨 Emergency Alert', e.text, [{ text: 'OK' }]);
+      // Auto-scroll to top when new alert arrives
+      setTimeout(() => scrollViewRef.current?.scrollTo({ y: 0, animated: true }), 100);
     });
     const sub2 = emitter.addListener('MeshStatus', (e: { message: string }) => {
-      setLog((l) => [e.message, ...l]);
+      const timestamp = new Date().toLocaleTimeString();
+      setLog((l) => [`[${timestamp}] ${e.message}`, ...l]);
       
       // Update connection status
-      if (e.message.includes('Connected to peer')) {
+      if (e.message.includes('Starting mesh service') || e.message.includes('Requesting permissions')) {
+        setConnectionStatus('connecting');
+        setIsLoading(true);
+      } else if (e.message.includes('Connected to peer') || e.message.includes('Connection accepted')) {
         setIsConnected(true);
+        setConnectionStatus('connected');
+        setIsLoading(false);
         setPeerCount(prev => prev + 1);
-      } else if (e.message.includes('Disconnected from peer')) {
-        setPeerCount(prev => Math.max(0, prev - 1));
-        if (peerCount <= 1) setIsConnected(false);
+      } else if (e.message.includes('Disconnected from peer') || e.message.includes('Lost peer')) {
+        setPeerCount(prev => {
+          const newCount = Math.max(0, prev - 1);
+          if (newCount === 0) {
+            setIsConnected(false);
+            setConnectionStatus('disconnected');
+          }
+          return newCount;
+        });
       } else if (e.message.includes('Broadcasting to')) {
-        const match = e.message.match(/Broadcasting to (\d+) peers/);
+        // Don't update connection status from broadcast messages
+        // They show recipient count (excluding sender), not actual connections
+        // The actual connection status is updated from "Status: X peers connected" messages
+        // Just ignore these messages for connection status updates
+      } else if (e.message.includes('Status:') && e.message.includes('peers connected')) {
+        // Update connection status from actual status messages
+        const regex = /Status: (\d+) peers connected/;
+        const match = regex.exec(e.message);
         if (match) {
-          const count = parseInt(match[1]);
+          const count = Number.parseInt(match[1], 10);
           setPeerCount(count);
           setIsConnected(count > 0);
+          setConnectionStatus(count > 0 ? 'connected' : 'disconnected');
         }
+      } else if (e.message.includes('Reconnecting') || e.message.includes('Retrying')) {
+        setConnectionStatus('connecting');
+      } else if (e.message.includes('Started advertising') || e.message.includes('Started discovery')) {
+        setIsLoading(false);
       }
     });
     return () => {
       sub1.remove();
       sub2.remove();
     };
-  }, [peerCount]);
+  }, []);
 
   const requestPermissionsAndStart = async () => {
     try {
-      setLog((l) => ['🔐 Requesting permissions...', ...l]);
+      setIsLoading(true);
+      setConnectionStatus('connecting');
+      const timestamp = new Date().toLocaleTimeString();
+      setLog((l) => [`[${timestamp}] 🔐 Requesting permissions...`, ...l]);
       
       // Request permissions through the native module
       await Mesh.requestPermissions();
@@ -77,11 +143,14 @@ function AppContent() {
       // Wait a moment for permissions to be processed
       await new Promise(resolve => setTimeout(resolve, 1000));
       
-      setLog((l) => ['🚀 Starting mesh service...', ...l]);
+      setLog((l) => [`[${new Date().toLocaleTimeString()}] 🚀 Starting mesh service...`, ...l]);
       await Mesh.startService();
-      setLog((l) => ['✅ Mesh service started', ...l]);
-    } catch (err) {
-      setLog((l) => [`❌ Error: ${err.message}`, ...l]);
+      setLog((l) => [`[${new Date().toLocaleTimeString()}] ✅ Mesh service started`, ...l]);
+    } catch (err: any) {
+      setIsLoading(false);
+      setConnectionStatus('disconnected');
+      const timestamp = new Date().toLocaleTimeString();
+      setLog((l) => [`[${timestamp}] ❌ Error: ${err.message || 'Unknown error'}`, ...l]);
     }
   };
 
@@ -90,74 +159,169 @@ function AppContent() {
       Alert.alert('Error', 'Please enter an alert message');
       return;
     }
+    const timestamp = new Date().toLocaleTimeString();
     Mesh.sendAlert(text).then(() => {
-      setLog((l) => [`📤 Sent: ${text}`, ...l]);
+      setLog((l) => [`[${timestamp}] 📤 Sent: ${text}`, ...l]);
       Vibration.vibrate([100, 50, 100]);
-    }).catch(err => {
-      setLog((l) => [`❌ Send failed: ${err.message}`, ...l]);
+      // Auto-scroll to top when sending
+      setTimeout(() => scrollViewRef.current?.scrollTo({ y: 0, animated: true }), 100);
+    }).catch((err: any) => {
+      setLog((l) => [`[${new Date().toLocaleTimeString()}] ❌ Send failed: ${err.message || 'Unknown error'}`, ...l]);
     });
   };
 
   const retryPermissions = () => {
-    setLog((l) => ['🔄 Retrying permissions...', ...l]);
+    const timestamp = new Date().toLocaleTimeString();
+    setLog((l) => [`[${timestamp}] 🔄 Retrying permissions...`, ...l]);
     requestPermissionsAndStart();
   };
 
   const clearLog = () => {
-    setLog([]);
+    Alert.alert(
+      'Clear Log',
+      'Are you sure you want to clear all log entries?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Clear', style: 'destructive', onPress: () => setLog([]) },
+      ]
+    );
+  };
+
+  const getStatusColor = () => {
+    return statusColorAnim.interpolate({
+      inputRange: [0, 1],
+      outputRange: ['#F44336', '#4CAF50'],
+    });
+  };
+
+  const getStatusText = () => {
+    if (isLoading || connectionStatus === 'connecting') {
+      return '🟡 Connecting...';
+    }
+    if (isConnected && peerCount > 0) {
+      return `🟢 Connected (${peerCount} ${peerCount === 1 ? 'peer' : 'peers'})`;
+    }
+    return '🔴 Disconnected';
   };
 
   return (
     <View style={[styles.container, { paddingTop: safeAreaInsets.top }]}>
-      {/* Header */}
+      {/* Header with Gradient Effect */}
       <View style={styles.header}>
-        <Text style={styles.title}>🚨 HimSafeNet Mesh</Text>
-        <Text style={styles.subtitle}>Offline Emergency Alert System</Text>
-        
-        {/* Status Indicator */}
-        <View style={[styles.statusContainer, { backgroundColor: isConnected ? '#4CAF50' : '#F44336' }]}>
-          <Text style={styles.statusText}>
-            {isConnected ? `🟢 Connected (${peerCount} peers)` : '🔴 Disconnected'}
-          </Text>
+        <View style={styles.headerContent}>
+          <Text style={styles.title}>🚨 HimSafeNet Mesh</Text>
+          <Text style={styles.subtitle}>Offline Emergency Alert System</Text>
+          
+          {/* Status Indicator with Animation */}
+          <Animated.View 
+            style={[
+              styles.statusContainer, 
+              { 
+                backgroundColor: getStatusColor(),
+              }
+            ]}
+          >
+            <Animated.View
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                justifyContent: 'center',
+                transform: [{ scale: pulseAnim }],
+              }}
+            >
+              {isLoading && (
+                <ActivityIndicator size="small" color="white" style={styles.statusLoader} />
+              )}
+              <Text style={styles.statusText}>
+                {getStatusText()}
+              </Text>
+            </Animated.View>
+          </Animated.View>
         </View>
       </View>
 
-      {/* Alert Input */}
+      {/* Alert Input Card */}
       <View style={styles.inputContainer}>
-        <Text style={styles.inputLabel}>Emergency Alert Message:</Text>
+        <View style={styles.inputHeader}>
+          <Text style={styles.inputLabel}>📢 Emergency Alert Message</Text>
+          <View style={[styles.charCountContainer, { opacity: text.length > 0 ? 1 : 0.5 }]}>
+            <Text style={styles.charCount}>{text.length} characters</Text>
+          </View>
+        </View>
         <TextInput
           value={text}
           onChangeText={setText}
           style={styles.textInput}
           placeholder="Type your emergency alert message here..."
+          placeholderTextColor="#999"
           multiline
           numberOfLines={3}
+          maxLength={500}
         />
-        <TouchableOpacity style={[styles.sendButton, { opacity: text.trim() ? 1 : 0.5 }]} onPress={send}>
+        <TouchableOpacity 
+          style={[
+            styles.sendButton, 
+            { 
+              opacity: text.trim() ? 1 : 0.5,
+              shadowColor: text.trim() ? '#F44336' : '#999',
+            }
+          ]} 
+          onPress={send}
+          disabled={!text.trim()}
+        >
           <Text style={styles.sendButtonText}>🚨 SEND ALERT</Text>
         </TouchableOpacity>
       </View>
 
       {/* Control Buttons */}
       <View style={styles.controlContainer}>
-        <TouchableOpacity style={styles.retryButton} onPress={retryPermissions}>
-          <Text style={styles.retryButtonText}>🔄 Retry Permissions</Text>
+        <TouchableOpacity 
+          style={[styles.controlButton, styles.retryButton]} 
+          onPress={retryPermissions}
+          disabled={isLoading}
+        >
+          <Text style={styles.controlButtonText}>
+            {isLoading ? '⏳ Connecting...' : '🔄 Retry Connection'}
+          </Text>
         </TouchableOpacity>
-        <TouchableOpacity style={styles.clearButton} onPress={clearLog}>
-          <Text style={styles.clearButtonText}>🗑️ Clear Log</Text>
+        <TouchableOpacity 
+          style={[styles.controlButton, styles.clearButton]} 
+          onPress={clearLog}
+          disabled={log.length === 0}
+        >
+          <Text style={[styles.controlButtonText, { opacity: log.length === 0 ? 0.5 : 1 }]}>
+            🗑️ Clear Log
+          </Text>
         </TouchableOpacity>
       </View>
 
-      {/* Log */}
+      {/* Log Container */}
       <View style={styles.logContainer}>
-        <Text style={styles.logTitle}>📋 System Log:</Text>
-        <ScrollView style={styles.logScrollView} showsVerticalScrollIndicator={true}>
-          {log.map((item, idx) => (
-            <View key={`${idx}-${item}`} style={styles.logItem}>
-              <Text style={styles.logText}>{item}</Text>
-            </View>
-          ))}
-        </ScrollView>
+        <View style={styles.logHeader}>
+          <Text style={styles.logTitle}>📋 System Log</Text>
+          <View style={styles.logBadge}>
+            <Text style={styles.logBadgeText}>{log.length}</Text>
+          </View>
+        </View>
+        {log.length === 0 ? (
+          <View style={styles.emptyLogContainer}>
+            <Text style={styles.emptyLogText}>No log entries yet</Text>
+            <Text style={styles.emptyLogSubtext}>System events and alerts will appear here</Text>
+          </View>
+        ) : (
+          <ScrollView 
+            ref={scrollViewRef}
+            style={styles.logScrollView} 
+            showsVerticalScrollIndicator={true}
+            contentContainerStyle={styles.logContent}
+          >
+            {log.map((item, idx) => (
+              <View key={`${idx}-${item}`} style={styles.logItem}>
+                <Text style={styles.logText}>{item}</Text>
+              </View>
+            ))}
+          </ScrollView>
+        )}
       </View>
     </View>
   );
@@ -166,138 +330,229 @@ function AppContent() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f5f5f5',
+    backgroundColor: '#f0f4f8',
   },
   header: {
-    backgroundColor: '#2196F3',
+    backgroundColor: '#1e3a8a',
+    paddingBottom: 20,
+    borderBottomLeftRadius: 25,
+    borderBottomRightRadius: 25,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  headerContent: {
     padding: 20,
-    paddingBottom: 15,
+    paddingTop: 15,
     alignItems: 'center',
   },
   title: {
-    fontSize: 24,
+    fontSize: 28,
     fontWeight: 'bold',
     color: 'white',
-    marginBottom: 5,
+    marginBottom: 6,
+    textShadowColor: 'rgba(0, 0, 0, 0.3)',
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 4,
   },
   subtitle: {
     fontSize: 14,
-    color: 'rgba(255,255,255,0.8)',
-    marginBottom: 15,
+    color: 'rgba(255,255,255,0.9)',
+    marginBottom: 18,
+    fontWeight: '500',
   },
   statusContainer: {
-    paddingHorizontal: 15,
-    paddingVertical: 8,
-    borderRadius: 20,
-    minWidth: 200,
+    flexDirection: 'row',
     alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 25,
+    minWidth: 220,
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 4,
+  },
+  statusLoader: {
+    marginRight: 8,
   },
   statusText: {
     color: 'white',
     fontWeight: 'bold',
-    fontSize: 14,
+    fontSize: 15,
+    letterSpacing: 0.5,
   },
   inputContainer: {
-    margin: 15,
+    margin: 16,
     backgroundColor: 'white',
-    borderRadius: 12,
-    padding: 15,
+    borderRadius: 16,
+    padding: 18,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.15,
+    shadowRadius: 6,
+    elevation: 5,
+  },
+  inputHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
   },
   inputLabel: {
-    fontSize: 16,
+    fontSize: 17,
+    fontWeight: '700',
+    color: '#1e3a8a',
+    flex: 1,
+  },
+  charCountContainer: {
+    backgroundColor: '#e0e7ff',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  charCount: {
+    fontSize: 11,
+    color: '#6366f1',
     fontWeight: '600',
-    color: '#333',
-    marginBottom: 10,
   },
   textInput: {
-    borderWidth: 1,
-    borderColor: '#ddd',
-    borderRadius: 8,
-    padding: 12,
+    borderWidth: 2,
+    borderColor: '#e5e7eb',
+    borderRadius: 12,
+    padding: 14,
     fontSize: 16,
     backgroundColor: '#fafafa',
     textAlignVertical: 'top',
-    minHeight: 80,
+    minHeight: 100,
+    color: '#1f2937',
+    fontFamily: 'System',
   },
   sendButton: {
     backgroundColor: '#F44336',
-    paddingVertical: 15,
-    paddingHorizontal: 20,
-    borderRadius: 8,
-    marginTop: 15,
+    paddingVertical: 16,
+    paddingHorizontal: 24,
+    borderRadius: 12,
+    marginTop: 16,
     alignItems: 'center',
+    shadowColor: '#F44336',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.4,
+    shadowRadius: 8,
+    elevation: 6,
   },
   sendButtonText: {
     color: 'white',
     fontSize: 18,
     fontWeight: 'bold',
+    letterSpacing: 1,
   },
   controlContainer: {
     flexDirection: 'row',
-    marginHorizontal: 15,
-    marginBottom: 15,
-    gap: 10,
+    marginHorizontal: 16,
+    marginBottom: 16,
+    gap: 12,
   },
-  retryButton: {
+  controlButton: {
     flex: 1,
-    backgroundColor: '#FF9800',
-    paddingVertical: 12,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  retryButtonText: {
-    color: 'white',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  clearButton: {
-    flex: 1,
-    backgroundColor: '#9E9E9E',
-    paddingVertical: 12,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  clearButtonText: {
-    color: 'white',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  logContainer: {
-    flex: 1,
-    margin: 15,
-    backgroundColor: 'white',
+    paddingVertical: 14,
     borderRadius: 12,
-    padding: 15,
+    alignItems: 'center',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.1,
     shadowRadius: 4,
     elevation: 3,
   },
+  retryButton: {
+    backgroundColor: '#FF9800',
+  },
+  clearButton: {
+    backgroundColor: '#6b7280',
+  },
+  controlButtonText: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  logContainer: {
+    flex: 1,
+    margin: 16,
+    marginTop: 0,
+    backgroundColor: 'white',
+    borderRadius: 16,
+    padding: 18,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.15,
+    shadowRadius: 6,
+    elevation: 5,
+  },
+  logHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
   logTitle: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#333',
-    marginBottom: 10,
+    fontSize: 17,
+    fontWeight: '700',
+    color: '#1e3a8a',
+  },
+  logBadge: {
+    backgroundColor: '#3b82f6',
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    minWidth: 30,
+    alignItems: 'center',
+  },
+  logBadgeText: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: 'bold',
   },
   logScrollView: {
     flex: 1,
   },
+  logContent: {
+    paddingBottom: 10,
+  },
   logItem: {
-    paddingVertical: 6,
-    paddingHorizontal: 8,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
     borderBottomWidth: 1,
-    borderBottomColor: '#f0f0f0',
+    borderBottomColor: '#f3f4f6',
+    backgroundColor: '#fafafa',
+    marginBottom: 6,
+    borderRadius: 8,
   },
   logText: {
     fontSize: 13,
-    color: '#555',
+    color: '#374151',
     fontFamily: 'monospace',
+    lineHeight: 18,
+  },
+  emptyLogContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingVertical: 40,
+  },
+  emptyLogText: {
+    fontSize: 16,
+    color: '#9ca3af',
+    fontWeight: '600',
+    marginBottom: 8,
+  },
+  emptyLogSubtext: {
+    fontSize: 13,
+    color: '#d1d5db',
+    textAlign: 'center',
   },
 });
 

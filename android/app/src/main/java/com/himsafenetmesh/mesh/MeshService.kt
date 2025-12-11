@@ -26,12 +26,16 @@ class MeshService : Service() {
   private val connections by lazy { Nearby.getConnectionsClient(this) }
   private val connectedEndpoints = ConcurrentHashMap.newKeySet<String>()
   private val seenAlertIds = ConcurrentHashMap.newKeySet<String>()
+  private val lostEndpoints = ConcurrentHashMap<String, Long>() // Track lost endpoints with timestamp
   private val serviceId = "com.himsafenetmesh.mesh"
   private val endpointName = Build.MODEL ?: "Android"
   private var isAdvertising = false
   private var isDiscovering = false
+  private var isStoppingDiscovery = false
+  private var pendingDiscoveryStart = false
   private val discoveryHandler = android.os.Handler(android.os.Looper.getMainLooper())
   private val connectionHandler = android.os.Handler(android.os.Looper.getMainLooper())
+  private val reconnectHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
   override fun onCreate() {
     super.onCreate()
@@ -123,7 +127,8 @@ class MeshService : Service() {
         val json = String(bytes, StandardCharsets.UTF_8)
         android.util.Log.d("MeshService", "📨 Received JSON: $json")
         android.util.Log.d("MeshService", "📨 JSON length: ${json.length}")
-        handleIncoming(json)
+        // Pass the sender endpointId to prevent sending back to them
+        handleIncoming(json, endpointId)
       } ?: run {
         android.util.Log.w("MeshService", "⚠️ Received payload with no bytes from: $endpointId")
       }
@@ -155,6 +160,8 @@ class MeshService : Service() {
       android.util.Log.d("MeshService", "📊 CONNECTION RESULT for $endpointId: ${result.status}")
       if (result.status.isSuccess) {
         connectedEndpoints.add(endpointId)
+        // Remove from lost endpoints if reconnected
+        lostEndpoints.remove(endpointId)
         android.util.Log.d("MeshService", "✅ CONNECTED to peer: $endpointId")
         MeshModule.emitStatus("✅ Connected to peer: $endpointId")
         updateForegroundNotification()
@@ -163,14 +170,50 @@ class MeshService : Service() {
         android.util.Log.w("MeshService", "❌ FAILED to connect to peer: $endpointId, status: ${result.status}")
         android.util.Log.w("MeshService", "❌ Status code: ${result.status.statusCode}")
         MeshModule.emitStatus("❌ Failed to connect to peer: ${result.status}")
+        
+        // Mark as lost for potential reconnection
+        if (!connectedEndpoints.contains(endpointId)) {
+          lostEndpoints[endpointId] = System.currentTimeMillis()
+        }
       }
     }
     override fun onDisconnected(endpointId: String) {
-      connectedEndpoints.remove(endpointId)
-      android.util.Log.d("MeshService", "❌ DISCONNECTED from peer: $endpointId")
-      MeshModule.emitStatus("❌ Disconnected from peer: $endpointId")
-      updateForegroundNotification()
-      logStatus()
+      val wasConnected = connectedEndpoints.remove(endpointId)
+      
+      if (wasConnected) {
+        // Track lost endpoint for potential reconnection
+        lostEndpoints[endpointId] = System.currentTimeMillis()
+        android.util.Log.d("MeshService", "❌ DISCONNECTED from peer: $endpointId")
+        MeshModule.emitStatus("❌ Disconnected from peer: $endpointId")
+        updateForegroundNotification()
+        logStatus()
+        
+        // Ensure discovery is running for reconnection
+        if (!isDiscovering && !isStoppingDiscovery) {
+          android.util.Log.d("MeshService", "🔄 Restarting discovery for reconnection...")
+          startDiscovery()
+        }
+        
+        // Attempt to reconnect after a delay - discovery should find it again
+        reconnectHandler.postDelayed({
+          if (!connectedEndpoints.contains(endpointId)) {
+            android.util.Log.d("MeshService", "🔄 Checking reconnection status for: $endpointId")
+            // Discovery should have found it by now if it's available
+            // If still not connected and it's been less than 2 minutes, keep trying
+            val lostTime = lostEndpoints[endpointId]
+            if (lostTime != null && System.currentTimeMillis() - lostTime < 120000) {
+              if (!isDiscovering && !isStoppingDiscovery) {
+                android.util.Log.d("MeshService", "🔄 Restarting discovery to find lost peer...")
+                startDiscovery()
+              }
+            } else if (lostTime != null) {
+              // Remove old lost endpoints (older than 2 minutes)
+              lostEndpoints.remove(endpointId)
+              android.util.Log.d("MeshService", "⏹️ Removed old lost endpoint: $endpointId")
+            }
+          }
+        }, 5000)
+      }
     }
   }
 
@@ -178,12 +221,23 @@ class MeshService : Service() {
     override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
       android.util.Log.d("MeshService", "🔍 FOUND PEER: $endpointId, name: ${info.endpointName}")
       android.util.Log.d("MeshService", "🔍 Service ID: ${info.serviceId}")
-      MeshModule.emitStatus("🔍 Found peer: ${info.endpointName}")
       
       // Skip if already connected
       if (connectedEndpoints.contains(endpointId)) {
         android.util.Log.d("MeshService", "🔄 Already connected to: $endpointId")
+        // Remove from lost endpoints if it was there
+        lostEndpoints.remove(endpointId)
         return
+      }
+      
+      // Check if this was a previously lost endpoint (reconnection)
+      val wasLost = lostEndpoints.containsKey(endpointId)
+      if (wasLost) {
+        android.util.Log.d("MeshService", "🔄 Reconnecting to previously lost peer: $endpointId")
+        MeshModule.emitStatus("🔄 Reconnecting to: ${info.endpointName}")
+        lostEndpoints.remove(endpointId)
+      } else {
+        MeshModule.emitStatus("🔍 Found peer: ${info.endpointName}")
       }
       
       android.util.Log.d("MeshService", "🤝 Requesting connection to: $endpointId")
@@ -200,13 +254,37 @@ class MeshService : Service() {
             connectionHandler.postDelayed({
               android.util.Log.d("MeshService", "🔄 Retrying connection to: $endpointId")
               connections.requestConnection(endpointName, endpointId, connectionLifecycleCallback)
+                .addOnFailureListener { retryError ->
+                  android.util.Log.e("MeshService", "❌ Retry failed for: $endpointId", retryError)
+                  // Mark as lost if retry fails
+                  if (!connectedEndpoints.contains(endpointId)) {
+                    lostEndpoints[endpointId] = System.currentTimeMillis()
+                  }
+                }
             }, 3000)
           }
         }
     }
     override fun onEndpointLost(endpointId: String) {
       android.util.Log.d("MeshService", "❌ Lost peer: $endpointId")
-      MeshModule.emitStatus("❌ Lost peer: $endpointId")
+      
+      // Remove from connected if it was connected
+      val wasConnected = connectedEndpoints.remove(endpointId)
+      
+      if (wasConnected) {
+        MeshModule.emitStatus("❌ Lost peer: $endpointId")
+        updateForegroundNotification()
+        logStatus()
+      }
+      
+      // Track lost endpoint for potential reconnection
+      lostEndpoints[endpointId] = System.currentTimeMillis()
+      
+      // Ensure discovery continues to run for reconnection
+      if (wasConnected && !isDiscovering && !isStoppingDiscovery) {
+        android.util.Log.d("MeshService", "🔄 Restarting discovery after peer loss...")
+        startDiscovery()
+      }
     }
   }
 
@@ -240,8 +318,16 @@ class MeshService : Service() {
   }
 
   private fun startDiscovery() {
+    // If already discovering, skip
     if (isDiscovering) {
       android.util.Log.d("MeshService", "Already discovering, skipping")
+      return
+    }
+    
+    // If currently stopping, mark that we want to start after stop completes
+    if (isStoppingDiscovery) {
+      android.util.Log.d("MeshService", "Discovery is stopping, will start after stop completes")
+      pendingDiscoveryStart = true
       return
     }
     
@@ -252,18 +338,26 @@ class MeshService : Service() {
     connections.startDiscovery(serviceId, endpointDiscoveryCallback, options)
       .addOnSuccessListener { 
         isDiscovering = true
+        pendingDiscoveryStart = false
         android.util.Log.d("MeshService", "✅ Started discovery successfully")
         MeshModule.emitStatus("🔍 Started discovery - looking for peers...")
       }
-      .addOnFailureListener { 
+      .addOnFailureListener { e ->
         isDiscovering = false
-        android.util.Log.e("MeshService", "❌ Failed to start discovery", it)
-        android.util.Log.e("MeshService", "❌ Error details: ${it.message}")
-        MeshModule.emitStatus("❌ Failed to start discovery: ${it.message}")
+        pendingDiscoveryStart = false
+        android.util.Log.e("MeshService", "❌ Failed to start discovery", e)
+        android.util.Log.e("MeshService", "❌ Error details: ${e.message}")
         
-        // Only retry if it's not an "already discovering" error
-        val isAlreadyDiscovering = it.message?.contains("already discovering", ignoreCase = true) ?: false
-        if (!isAlreadyDiscovering) {
+        // Check if it's an "already discovering" error - this means the flag is out of sync
+        val isAlreadyDiscovering = e.message?.contains("already discovering", ignoreCase = true) ?: false
+        if (isAlreadyDiscovering) {
+          android.util.Log.w("MeshService", "⚠️ Discovery already running (flag out of sync), syncing state...")
+          // Sync the state - discovery is actually running
+          isDiscovering = true
+          MeshModule.emitStatus("🔍 Discovery already running")
+        } else {
+          MeshModule.emitStatus("❌ Failed to start discovery: ${e.message}")
+          // Retry after a delay for other errors
           discoveryHandler.postDelayed({
             android.util.Log.d("MeshService", "🔄 Retrying discovery...")
             startDiscovery()
@@ -280,12 +374,14 @@ class MeshService : Service() {
       ttl = 8
     )
     val json = serialize(msg)
-    broadcast(json)
+    // When we send our own alert, don't exclude anyone (null means broadcast to all)
+    broadcast(json, null)
     // Don't show our own alert in UI, just broadcast it
   }
 
-  private fun handleIncoming(json: String) {
+  private fun handleIncoming(json: String, senderEndpointId: String) {
     android.util.Log.d("MeshService", "🔍 Processing incoming JSON: $json")
+    android.util.Log.d("MeshService", "🔍 Sender endpoint: $senderEndpointId")
     val msg = deserialize(json)
     if (msg == null) {
       android.util.Log.e("MeshService", "❌ Failed to deserialize JSON: $json")
@@ -301,23 +397,42 @@ class MeshService : Service() {
     android.util.Log.d("MeshService", "🚨 EMITTING ALERT TO UI: ${msg.text}")
     onAlertReceived(msg)
     
+    // Relay the message to other peers, but exclude the sender to prevent loops
     if (msg.ttl > 1) {
       val next = msg.copy(ttl = msg.ttl - 1)
-      android.util.Log.d("MeshService", "📡 Relaying alert (TTL: ${next.ttl})")
-      broadcast(serialize(next))
+      android.util.Log.d("MeshService", "📡 Relaying alert (TTL: ${next.ttl}) - excluding sender: $senderEndpointId")
+      // Exclude the sender to prevent sending the message back to them
+      broadcast(serialize(next), senderEndpointId)
     } else {
       android.util.Log.d("MeshService", "⏹️ Alert TTL expired, not relaying")
     }
   }
 
-  private fun broadcast(json: String) {
+  private fun broadcast(json: String, excludeEndpointId: String? = null) {
     val payload = Payload.fromBytes(json.toByteArray(StandardCharsets.UTF_8))
-    android.util.Log.d("MeshService", "📡 Broadcasting to ${connectedEndpoints.size} peers")
+    
+    // Filter out the excluded endpoint (sender) to prevent message loops
+    val recipients = if (excludeEndpointId != null) {
+      connectedEndpoints.filter { it != excludeEndpointId }
+    } else {
+      connectedEndpoints.toList()
+    }
+    
+    android.util.Log.d("MeshService", "📡 Broadcasting to ${recipients.size} peers (excluding: ${excludeEndpointId ?: "none"})")
     android.util.Log.d("MeshService", "📡 Broadcasting JSON: $json")
     android.util.Log.d("MeshService", "📡 Payload size: ${json.toByteArray(StandardCharsets.UTF_8).size} bytes")
-    MeshModule.emitStatus("📡 Broadcasting to ${connectedEndpoints.size} peers")
+    // Don't emit status about broadcast recipients - it confuses the UI
+    // Instead, just log it and emit the actual connection status
+    android.util.Log.d("MeshService", "📡 Connected peers: ${connectedEndpoints.size}, Broadcasting to: ${recipients.size}")
     
-    connectedEndpoints.forEach { eid -> 
+    if (recipients.isEmpty()) {
+      android.util.Log.d("MeshService", "⚠️ No recipients to broadcast to (all peers excluded or none connected)")
+      // Still emit connection status to keep UI accurate
+      MeshModule.emitStatus("📊 Status: ${connectedEndpoints.size} peers connected")
+      return
+    }
+    
+    recipients.forEach { eid -> 
       android.util.Log.d("MeshService", "📤 Sending payload to peer: $eid")
       connections.sendPayload(eid, payload)
         .addOnSuccessListener {
@@ -328,6 +443,9 @@ class MeshService : Service() {
           MeshModule.emitStatus("❌ Failed to send to peer: $eid")
         }
     }
+    
+    // Emit actual connection status after broadcasting to keep UI accurate
+    MeshModule.emitStatus("📊 Status: ${connectedEndpoints.size} peers connected")
   }
 
   private fun serialize(msg: AlertMessage): String {
@@ -448,25 +566,74 @@ class MeshService : Service() {
   }
   
   private fun startPeriodicDiscovery() {
-    // Restart discovery every 30 seconds to find new peers
+    // Restart discovery periodically to find new peers and reconnect to lost ones
     discoveryHandler.postDelayed(object : Runnable {
       override fun run() {
-        android.util.Log.d("MeshService", "🔄 Periodic discovery restart")
-        stopDiscovery()
-        // Wait a bit before restarting to avoid "out of order" errors
-        discoveryHandler.postDelayed({
+        // Clean up old lost endpoints (older than 2 minutes)
+        val now = System.currentTimeMillis()
+        val removed = lostEndpoints.entries.removeIf { (_, timestamp) -> now - timestamp > 120000 }
+        if (removed) {
+          android.util.Log.d("MeshService", "🧹 Cleaned up old lost endpoints")
+        }
+        
+        // Only restart discovery if:
+        // 1. We have lost endpoints we're trying to reconnect to, OR
+        // 2. We have no connections and need to find peers
+        // AND discovery is not currently running or stopping
+        val shouldRestart = (lostEndpoints.isNotEmpty() || connectedEndpoints.isEmpty()) && 
+                           !isDiscovering && !isStoppingDiscovery
+        
+        if (shouldRestart) {
+          android.util.Log.d("MeshService", "🔄 Periodic discovery restart (lost: ${lostEndpoints.size}, connected: ${connectedEndpoints.size})")
           startDiscovery()
-        }, 2000)
+        } else {
+          android.util.Log.d("MeshService", "⏸️ Skipping periodic restart (discovering: $isDiscovering, stopping: $isStoppingDiscovery)")
+        }
+        
         discoveryHandler.postDelayed(this, 30000) // 30 seconds
       }
     }, 30000)
   }
   
   private fun stopDiscovery() {
-    if (isDiscovering) {
-      android.util.Log.d("MeshService", "Stopping discovery...")
+    if (!isDiscovering) {
+      android.util.Log.d("MeshService", "Not discovering, nothing to stop")
+      return
+    }
+    
+    if (isStoppingDiscovery) {
+      android.util.Log.d("MeshService", "Already stopping discovery, skipping")
+      return
+    }
+    
+    isStoppingDiscovery = true
+    android.util.Log.d("MeshService", "Stopping discovery...")
+    
+    try {
       connections.stopDiscovery()
+      android.util.Log.d("MeshService", "✅ Discovery stopped successfully")
       isDiscovering = false
+      isStoppingDiscovery = false
+      
+      // If there was a pending start request, start now
+      if (pendingDiscoveryStart) {
+        android.util.Log.d("MeshService", "Starting discovery after stop (pending request)")
+        discoveryHandler.postDelayed({
+          startDiscovery()
+        }, 1000) // Wait 1 second after stop before starting
+      }
+    } catch (e: Exception) {
+      android.util.Log.e("MeshService", "❌ Exception stopping discovery", e)
+      // Even if stop fails, mark as not discovering to avoid getting stuck
+      isDiscovering = false
+      isStoppingDiscovery = false
+      
+      // If there was a pending start, try to start anyway
+      if (pendingDiscoveryStart) {
+        discoveryHandler.postDelayed({
+          startDiscovery()
+        }, 2000)
+      }
     }
   }
   
@@ -490,10 +657,14 @@ class MeshService : Service() {
           startAdvertising()
         }
         
-        // Restart discovery if it stopped
-        if (!isDiscovering) {
-          android.util.Log.d("MeshService", "🔄 Restarting discovery...")
-          startDiscovery()
+        // Only restart discovery if it's actually stopped (not just stopping)
+        // And we have a reason to discover (lost endpoints or no connections)
+        if (!isDiscovering && !isStoppingDiscovery) {
+          val hasReasonToDiscover = lostEndpoints.isNotEmpty() || connectedEndpoints.isEmpty()
+          if (hasReasonToDiscover) {
+            android.util.Log.d("MeshService", "🔄 Restarting discovery (status check)...")
+            startDiscovery()
+          }
         }
         
         connectionHandler.postDelayed(this, 10000) // 10 seconds
@@ -505,9 +676,15 @@ class MeshService : Service() {
     super.onDestroy()
     discoveryHandler.removeCallbacksAndMessages(null)
     connectionHandler.removeCallbacksAndMessages(null)
+    reconnectHandler.removeCallbacksAndMessages(null)
     stopAdvertising()
     stopDiscovery()
     connections.stopAllEndpoints()
+    connectedEndpoints.clear()
+    lostEndpoints.clear()
+    isDiscovering = false
+    isStoppingDiscovery = false
+    pendingDiscoveryStart = false
     android.util.Log.d("MeshService", "MeshService destroyed")
   }
 }
