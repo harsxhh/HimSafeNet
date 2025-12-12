@@ -96,6 +96,56 @@ class MeshModule(private val ctx: ReactApplicationContext) : ReactContextBaseJav
     ctx.startService(intent)
     promise.resolve(null)
   }
+
+  @ReactMethod
+  fun startBLESensor(promise: Promise) {
+    val activity = ctx.currentActivity
+    if (activity == null) {
+      promise.reject("NO_ACTIVITY", "No current activity")
+      return
+    }
+
+    // Determine required permissions based on Android version
+    val requiredPermissions = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+      // Android 12+ (API 31+)
+      // BLUETOOTH_SCAN and BLUETOOTH_CONNECT are required
+      // Location is still recommended for BLE scanning
+      arrayOf(
+        Manifest.permission.BLUETOOTH_SCAN,
+        Manifest.permission.BLUETOOTH_CONNECT,
+        Manifest.permission.ACCESS_FINE_LOCATION,
+        Manifest.permission.ACCESS_COARSE_LOCATION // Request both, but either is fine
+      )
+    } else {
+      // Android 11 and below
+      // Need at least one location permission (FINE or COARSE)
+      arrayOf(
+        Manifest.permission.ACCESS_FINE_LOCATION,
+        Manifest.permission.ACCESS_COARSE_LOCATION
+      )
+    }
+
+    val missingPermissions = requiredPermissions.filter { permission ->
+      ContextCompat.checkSelfPermission(ctx, permission) != PackageManager.PERMISSION_GRANTED
+    }
+
+    if (missingPermissions.isNotEmpty()) {
+      emitStatus("🔐 Requesting BLE permissions: ${missingPermissions.joinToString(", ")}")
+      ActivityCompat.requestPermissions(
+        activity as Activity,
+        missingPermissions.toTypedArray(),
+        1002 // Different request code for BLE
+      )
+      emitStatus("📍 Please grant location permissions in the dialog that appears")
+    } else {
+      emitStatus("✅ All BLE permissions already granted")
+    }
+
+    // Start the service - it will check permissions and start scanning when ready
+    val intent = Intent(ctx, com.himsafenetmesh.ble.BLESensorService::class.java)
+    ctx.startService(intent)
+    promise.resolve(null)
+  }
 }
 
 

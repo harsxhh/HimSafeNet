@@ -10,6 +10,9 @@
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
+    <!-- Location permissions required for BLE scanning (Android requirement) -->
+    <!-- ACCESS_COARSE_LOCATION is needed for BLE scanning on Android 11 and below -->
+    <!-- ACCESS_FINE_LOCATION works on all versions and is preferred -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -42,5 +45,9 @@
         android:name="com.himsafenetmesh.mesh.MeshService"
         android:exported="false"
         android:foregroundServiceType="dataSync" />
+      <service
+        android:name="com.himsafenetmesh.ble.BLESensorService"
+        android:enabled="true"
+        android:exported="false" />
     </application>
 </manifest>

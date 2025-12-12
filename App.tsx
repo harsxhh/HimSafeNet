@@ -12,7 +12,7 @@ import {
 } from 'react-native-safe-area-context';
 import { useEffect, useRef, useState } from 'react';
 
-const { Mesh } = NativeModules as { Mesh: { startService: () => Promise<void>; sendAlert: (text: string) => Promise<void>; requestPermissions: () => Promise<void> } };
+const { Mesh } = NativeModules as { Mesh: { startService: () => Promise<void>; sendAlert: (text: string) => Promise<void>; requestPermissions: () => Promise<void>; startBLESensor: () => Promise<void> } };
 
 function App() {
   const isDarkMode = useColorScheme() === 'dark';
@@ -141,7 +141,7 @@ function AppContent() {
       await Mesh.requestPermissions();
       
       // Wait a moment for permissions to be processed
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise<void>(resolve => setTimeout(() => resolve(), 1000));
       
       setLog((l) => [`[${new Date().toLocaleTimeString()}] 🚀 Starting mesh service...`, ...l]);
       await Mesh.startService();
@@ -185,6 +185,30 @@ function AppContent() {
         { text: 'Clear', style: 'destructive', onPress: () => setLog([]) },
       ]
     );
+  };
+
+  const startBLESensor = async () => {
+    try {
+      const timestamp = new Date().toLocaleTimeString();
+      setLog((l) => [`[${timestamp}] 🔵 Starting BLE sensor monitoring...`, ...l]);
+      setLog((l) => [`[${new Date().toLocaleTimeString()}] 📍 Grant location permissions if prompted (required for BLE scanning)`, ...l]);
+      
+      // First request all permissions to make sure we have them
+      await Mesh.requestPermissions();
+      await new Promise<void>(resolve => setTimeout(() => resolve(), 500)); // Wait for permissions
+      
+      await Mesh.startBLESensor();
+      setLog((l) => [`[${new Date().toLocaleTimeString()}] ✅ BLE sensor service started`, ...l]);
+      setLog((l) => [`[${new Date().toLocaleTimeString()}] 💡 If you see permission errors, go to Settings → Apps → HimSafeNet Mesh → Permissions → Enable Location`, ...l]);
+    } catch (err: any) {
+      const timestamp = new Date().toLocaleTimeString();
+      setLog((l) => [`[${timestamp}] ❌ BLE Error: ${err.message || 'Unknown error'}`, ...l]);
+      Alert.alert(
+        'Permission Required',
+        'BLE scanning requires location permissions.\n\nPlease:\n1. Go to Android Settings\n2. Apps → HimSafeNet Mesh\n3. Permissions\n4. Enable "Location"\n\nThen try again.',
+        [{ text: 'OK' }]
+      );
+    }
   };
 
   const getStatusColor = () => {
@@ -275,24 +299,36 @@ function AppContent() {
 
       {/* Control Buttons */}
       <View style={styles.controlContainer}>
-        <TouchableOpacity 
-          style={[styles.controlButton, styles.retryButton]} 
-          onPress={retryPermissions}
-          disabled={isLoading}
-        >
-          <Text style={styles.controlButtonText}>
-            {isLoading ? '⏳ Connecting...' : '🔄 Retry Connection'}
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity 
-          style={[styles.controlButton, styles.clearButton]} 
-          onPress={clearLog}
-          disabled={log.length === 0}
-        >
-          <Text style={[styles.controlButtonText, { opacity: log.length === 0 ? 0.5 : 1 }]}>
-            🗑️ Clear Log
-          </Text>
-        </TouchableOpacity>
+        <View style={styles.controlRow}>
+          <TouchableOpacity
+            style={[styles.controlButton, styles.retryButton]} 
+            onPress={retryPermissions}
+            disabled={isLoading}
+          >
+            <Text style={styles.controlButtonText}>
+              {isLoading ? '⏳ Connecting...' : '🔄 Retry Connection'}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={[styles.controlButton, styles.bleButton]} 
+            onPress={startBLESensor}
+          >
+            <Text style={styles.controlButtonText}>
+              🔵 Start Sensor
+            </Text>
+          </TouchableOpacity>
+        </View>
+        <View style={styles.controlRow}>
+          <TouchableOpacity 
+            style={[styles.controlButton, styles.clearButton]} 
+            onPress={clearLog}
+            disabled={log.length === 0}
+          >
+            <Text style={[styles.controlButtonText, { opacity: log.length === 0 ? 0.5 : 1 }]}>
+              🗑️ Clear Log
+            </Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       {/* Log Container */}
@@ -452,10 +488,14 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
   },
   controlContainer: {
-    flexDirection: 'row',
     marginHorizontal: 16,
     marginBottom: 16,
     gap: 12,
+  },
+  controlRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 12,
   },
   controlButton: {
     flex: 1,
@@ -470,6 +510,9 @@ const styles = StyleSheet.create({
   },
   retryButton: {
     backgroundColor: '#FF9800',
+  },
+  bleButton: {
+    backgroundColor: '#2196F3',
   },
   clearButton: {
     backgroundColor: '#6b7280',
